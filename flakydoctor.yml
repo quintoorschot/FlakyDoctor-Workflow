@@ -1,0 +1,93 @@
+name: FlakyDoctor
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  flakydoctor:
+    runs-on: ubuntu-latest
+    container: ghcr.io/quintoorschot/cicd-flakydoc-env:latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run FlakyDoctor
+        id: flaky
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY || secrets.OPEN_API_KEY }}
+          OPEN_API_KEY:   ${{ secrets.OPENAI_API_KEY || secrets.OPEN_API_KEY }}
+        uses: quintoorschot/CICD-FlakyDoctor@main
+        with:
+          openai_api_key: ${{ secrets.OPENAI_API_KEY || secrets.OPEN_API_KEY }}
+
+      - name: Copy FlakyDoctor outputs into workspace
+        run: |
+          set -e
+          ACTION_DIR="/__w/_actions/quintoorschot/CICD-FlakyDoctor/main"
+          WS="$GITHUB_WORKSPACE"
+          mkdir -p "$WS/flakydoctor-output"
+
+          find "$ACTION_DIR" -maxdepth 5 -name 'flakydoctor*.patch' -print -exec cp -v {} "$WS/flakydoctor-output/" \; || true
+
+          if [ -d "$ACTION_DIR/FlakyDoctor/good_patches" ]; then
+            cp -v "$ACTION_DIR"/FlakyDoctor/good_patches/* "$WS/flakydoctor-output/" 2>/dev/null || true
+          fi
+
+      - name: Apply flakydoctor patch if it exists
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE"
+          PATCH_FILE=$(ls flakydoctor-output/*.patch 2>/dev/null | head -n 1 || true)
+          if [ -z "$PATCH_FILE" ]; then
+            echo "No .patch file to apply"
+            exit 0
+          fi
+          git apply --stat "$PATCH_FILE" || true
+          git apply --index --whitespace=fix "$PATCH_FILE" || {
+            git apply --reject --whitespace=fix "$PATCH_FILE" || true
+          }
+
+      - name: Configure git
+        run: |
+          git config --global user.email "flakydoctor-bot@example.com"
+          git config --global user.name "FlakyDoctor Bot"
+          git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
+          git config --global --add safe.directory '*' || true
+
+      - name: Commit and push branch
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          cd "$GITHUB_WORKSPACE"
+          if git diff --staged --quiet && git diff --quiet; then
+            echo "No changes -> no branch"
+            exit 0
+          fi
+          BRANCH="flakydoctor-patch-$(date +%Y%m%d%H%M%S)"
+          git checkout -b "$BRANCH"
+          git add -A
+          git commit -m "Apply FlakyDoctor patch for flaky tests"
+          git push origin "$BRANCH"
+          echo "branch_name=$BRANCH" >> "$GITHUB_OUTPUT"
+
+      - name: Open Pull Request
+        if: ${{ success() }}
+        uses: peter-evans/create-pull-request@v6
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          commit-message: "Apply FlakyDoctor patch for flaky tests"
+          branch: ${{ github.ref_name }}
+          head: ${{ github.actor }}:flakydoctor-patch-${{ github.run_id }}
+          title: "FlakyDoctor auto-patch: Fix flaky test(s)"
+          body: |
+            This PR was automatically created by FlakyDoctor after detecting and patching flaky tests.
+          labels: flakydoctor, automated-pr
