@@ -1,8 +1,6 @@
-name: FlakyDoctor
+name: AutoFlakyDoctor
 
-on:
-  push:
-  pull_request:
+on: [push, pull_request]
 
 permissions:
   contents: write
@@ -23,198 +21,294 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Mark the workspace as a safe Git directory to prevent Git safety errors
       - name: Mark workspace safe for git
         run: |
-          set -euo pipefail
           git config --global --add safe.directory "$GITHUB_WORKSPACE" || true
           git config --global --add safe.directory '*' || true
 
+      # Set and export filesystem path where the FlakyDoctor action is installed
+      - name: Set ACTION_DIR
+        run: |
+          if [ -n "${ACT:-}" ]; then
+            ACTION_DIR="/var/run/act/actions/quintoorschot-CICD-FlakyDoctor@main"
+          else
+            ACTION_DIR="/__w/_actions/quintoorschot/CICD-FlakyDoctor/main"
+          fi
+          echo "ACTION_DIR=$ACTION_DIR" >> "$GITHUB_ENV"
+          echo "Using ACTION_DIR=$ACTION_DIR"
+
+      # Create dedicated branch for FlakyDoctor’s patches and exposes its name for later steps
       - name: Create work branch
         id: branch
         run: |
-          set -euo pipefail
           BRANCH="flakydoctor-patch-${{ github.run_id }}"
-          git checkout -b "$BRANCH"
+          git checkout -B "$BRANCH"
           echo "branch_name=$BRANCH" >> "$GITHUB_OUTPUT"
 
-      - name: Generate tests.csv for FlakyDoctor
-        env:
-          # Where the action is downloaded by the runner
-          ACTION_DIR: /__w/_actions/quintoorschot/CICD-FlakyDoctor/main
-          # Parse tests from this path (file or directory)
-          SRC_PATH: src/test/java
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import os, re, pathlib
-
-          # Use provided env, with a safe default
-          action_dir = pathlib.Path(os.environ.get(
-              "ACTION_DIR", "/__w/_actions/quintoorschot/CICD-FlakyDoctor/main"
-          ))
-          src_path = pathlib.Path(os.environ.get("SRC_PATH", "src/test/java"))
-          gw = pathlib.Path(os.environ.get("GITHUB_WORKSPACE", "."))
-
-          tests = []
-
-          def parse_java(p: pathlib.Path):
-              txt = p.read_text(encoding="utf-8", errors="ignore")
-              pkg_m = re.search(r'^\s*package\s+([\w.]+)\s*;', txt, re.M)
-              pkg = pkg_m.group(1) if pkg_m else ""
-              cls_m = re.search(r'\bclass\s+([A-Za-z0-9_]+)\b', txt)
-              if not cls_m:
-                  return
-              cls = cls_m.group(1)
-              for m in re.finditer(r'@Test[\s\S]*?\b(?:public|protected|private)?\s+void\s+([A-Za-z0-9_]+)\s*\(', txt):
-                  method = m.group(1)
-                  tests.append(f"{pkg}.{cls}.{method}" if pkg else f"{cls}.{method}")
-
-          if src_path.is_file():
-              parse_java(src_path)
-          else:
-              for p in src_path.rglob("*.java"):
-                  parse_java(p)
-
-          out = action_dir / "tests.csv"
-          out.parent.mkdir(parents=True, exist_ok=True)
-          project = gw.name
-
-          with out.open("w", encoding="utf-8") as f:
-              for t in tests:
-                  f.write(f"{project},,.,{t},ID,ID,,,\n")
-
-          print(f"Wrote {len(tests)} rows to {out}")
-          PY
-
-
-
-      - name: Run FlakyDoctor
-        uses: quintoorschot/CICD-FlakyDoctor@main
-        with:
-          openai_api_key: ${{ secrets.OPENAI_API_KEY || secrets.OPEN_API_KEY }}
-        env:
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY || secrets.OPEN_API_KEY }}
-          OPEN_API_KEY:   ${{ secrets.OPENAI_API_KEY || secrets.OPEN_API_KEY }}
-
-      - name: Collect outputs
-        run: |
-          set -euo pipefail
-          ACTION_DIR="/__w/_actions/quintoorschot/CICD-FlakyDoctor/main"
-          OUT="$GITHUB_WORKSPACE/flakydoctor-output"
-          mkdir -p "$OUT"
-          find "$ACTION_DIR" -maxdepth 5 -name 'flakydoctor*.patch' -print -exec cp -v {} "$OUT/" \; || true
-          if [ -d "$ACTION_DIR/FlakyDoctor/good_patches" ]; then
-            cp -v "$ACTION_DIR"/FlakyDoctor/good_patches/* "$OUT/" 2>/dev/null || true
-          fi
-
-      - name: Apply .patch if present
-        run: |
-          set -euo pipefail
-          cd "$GITHUB_WORKSPACE"
-          PATCH_FILE=$(ls flakydoctor-output/*.patch 2>/dev/null | head -n 1 || true)
-          if [ -n "${PATCH_FILE:-}" ]; then
-            echo "Applying patch: $PATCH_FILE"
-            git apply --stat "$PATCH_FILE" || true
-            git apply --index --whitespace=fix "$PATCH_FILE" || {
-              echo "Retry with rejects"
-              git apply --reject --whitespace=fix "$PATCH_FILE" || true
-            }
-          else
-            echo "No .patch file to apply"
-          fi
-
-      - name: Apply Java good_patches (merge when multiple for same class)
-        run: |
-          set -euo pipefail
-          WS="$GITHUB_WORKSPACE"
-          SRC_DIR="$WS/src/test/java"
-          PATCH_DIR="$WS/flakydoctor-output"
-
-          shopt -s nullglob
-          declare -A GROUP
-          for f in "$PATCH_DIR"/good_patch.*.java; do
-            base="${f##*/}"
-            no_prefix="${base#good_patch.}"
-            class_path="$(echo "$no_prefix" | cut -d'#' -f1-3 | tr '#' '/')"
-            dest="$SRC_DIR/$class_path.java"
-            GROUP["$dest"]+="$f|"
-          done
-
-          for dest in "${!GROUP[@]}"; do
-            mkdir -p "$(dirname "$dest")"
-            IFS='|' read -r -a files <<<"${GROUP[$dest]}"
-            ancestor="$(mktemp)"
-            if [ -f "$dest" ]; then cp -f "$dest" "$ancestor"; else : >"$ancestor"; fi
-            cp -f "${files[0]}" "$dest"
-            for ((i=1; i<${#files[@]}; i++)); do
-              [ -n "${files[$i]}" ] || continue
-              git merge-file "$dest" "$ancestor" "${files[$i]}" || true
-            done
-            git add -f "$dest"
-            rm -f "$ancestor"
-          done
-
-      - name: Clean transient artifacts
-        run: |
-          set -euo pipefail
-          mkdir -p .git/info
-          {
-            echo 'flakydoctor-output/'
-            echo 'CICD-FlakyDoctor'
-            echo '.nondex/'
-          } >> .git/info/exclude
-          rm -rf "$GITHUB_WORKSPACE/flakydoctor-output" || true
-          rm -f  "$GITHUB_WORKSPACE/CICD-FlakyDoctor" || true
-          git rm -f --cached flakydoctor-output 2>/dev/null || true
-          git rm -f --cached CICD-FlakyDoctor 2>/dev/null || true
-          git rm -r -f --cached .nondex 2>/dev/null || true
-
+      # Configure the Git user so the workflow can create commits
       - name: Configure git identity
         run: |
-          set -euo pipefail
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git config --global user.name "github-actions[bot]"
 
-      - name: Commit and push branch (if changes)
+      # Fix and commit an invalid JUnit dependency scope in pom.xml if present
+      - name: Fix invalid plugin dependency scope in pom.xml (commit)
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          pom = Path("pom.xml")
+          text = pom.read_text(encoding="utf-8")
+
+          plugin_pat = re.compile(
+              r"<plugin>.*?<artifactId>\s*maven-checkstyle-plugin\s*</artifactId>.*?</plugin>",
+              re.S
+          )
+          dep_pat = re.compile(
+              r"(<artifactId>\s*junit-jupiter-api\s*</artifactId>.*?<scope>)test(</scope>)",
+              re.S
+          )
+
+          total_changes = 0
+
+          def repl(m):
+              global total_changes
+              block = m.group(0)
+              new_block, n = dep_pat.subn(r"\1compile\2", block)
+              total_changes += n
+              return new_block
+
+          new_text, _ = plugin_pat.subn(repl, text)
+          pom.write_text(new_text, encoding="utf-8")
+
+          if total_changes == 0:
+              print("No pom.xml changes needed")
+          else:
+              print(f"Fixed {total_changes} invalid junit-jupiter-api scope(s)")
+          PY
+
+          git add pom.xml
+          if ! git diff --cached --quiet; then
+            git commit -m "Fix invalid junit-jupiter-api scope in checkstyle plugin"
+          else
+            echo "pom.xml unchanged; nothing to commit"
+          fi
+
+      # Run FlakyDoctor GitHub Action
+      - name: Run FlakyDoctor
+        uses: quintoorschot/CICD-FlakyDoctor@main
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY || secrets.OPEN_API_KEY }}
+
+      # Copy FlakyDoctor’s generated patch files into the workspace so they can be applied in later steps
+      - name: Collect outputs
+        run: |
+          set -euo pipefail
+          OUT="$GITHUB_WORKSPACE/flakydoctor-output"
+          mkdir -p "$OUT"
+
+          echo "ACTION_DIR=$ACTION_DIR"
+          if [ -d "$ACTION_DIR" ]; then
+            # Copy any .patch files produced by the action
+            find "$ACTION_DIR" -maxdepth 6 -type f -name 'flakydoctor*.patch' -print -exec cp -v {} "$OUT/" \; || true
+
+            # Copy good_patches java files if present
+            if [ -d "$ACTION_DIR/FlakyDoctor/good_patches" ]; then
+              cp -v "$ACTION_DIR"/FlakyDoctor/good_patches/*.java "$OUT/" || true
+            fi
+          else
+            echo "WARNING: ACTION_DIR does not exist: $ACTION_DIR"
+          fi
+
+          echo "=== flakydoctor-output ==="
+          ls -lah "$OUT" || true
+          echo "patch count: $(ls -1 "$OUT"/*.patch 2>/dev/null | wc -l || true)"
+          echo "good_patch count: $(ls -1 "$OUT"/good_patch.*.java 2>/dev/null | wc -l || true)"
+
+      # Apply FlakyDoctor's suggested patches
+      - name: Apply .patch files
+        working-directory: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          patches=(flakydoctor-output/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "No .patch files found; skipping git-apply step"
+            exit 0
+          fi
+
+          printf "Applying %d patch(es):\n" "${#patches[@]}"
+          printf " - %s\n" "${patches[@]}"
+
+          for p in "${patches[@]}"; do
+            echo "Applying $p"
+            git apply --stat "$p" || true
+            git apply --index --whitespace=fix "$p" || {
+              echo "Retry with rejects for $p"
+              git apply --reject --whitespace=fix "$p" || true
+            }
+          done
+
+      # Merge FlakyDoctor's generated patches into the appropriate test files when no .patch files exist
+      - name: Apply Java good_patches
+        run: |
+          set -euo pipefail
+
+          if ls "$GITHUB_WORKSPACE"/flakydoctor-output/*.patch >/dev/null 2>&1; then
+            echo ".patch files exist; not applying good_patch.*.java (avoids overwriting)"
+            exit 0
+          fi
+
+          SRC="$GITHUB_WORKSPACE/src/test/java"
+          PATCH="$GITHUB_WORKSPACE/flakydoctor-output"
+
+          shopt -s nullglob
+          declare -A GROUP
+
+          # Group patch files by their destination class file
+          for f in "$PATCH"/good_patch.*.java; do
+            base="${f##*/}"            # good_patch.org#apache#...#Class#method.java
+            name="${base#good_patch.}" # org#apache#...#Class#method.java
+            name="${name%.java}"       # org#apache#...#Class#method
+
+            IFS='#' read -r -a parts <<< "$name"
+            if [ "${#parts[@]}" -lt 3 ]; then
+              echo "Skipping unexpected patch filename: $base"
+              continue
+            fi
+
+            class="${parts[-2]}"
+
+            dir=""
+            for ((i=0; i<${#parts[@]}-2; i++)); do
+              dir+="${parts[$i]}/"
+            done
+            dir="${dir%/}"
+
+            dest="$SRC/$dir/$class.java"
+            GROUP["$dest"]+="$f"$'\n'
+          done
+
+          # Apply all patches per dest via a 3-way merge against the original dest as base
+          for dest in "${!GROUP[@]}"; do
+            mkdir -p "$(dirname "$dest")"
+
+            basefile="$(mktemp)"
+            if [ -f "$dest" ]; then
+              cp -f "$dest" "$basefile"
+            else
+              : > "$basefile"
+              : > "$dest"
+            fi
+
+            echo "Merging patches into $dest"
+            while IFS= read -r f; do
+              [ -n "${f:-}" ] || continue
+              echo "  - merge $f"
+              git merge-file "$dest" "$basefile" "$f" || true
+
+              if grep -qE '^(<<<<<<<|=======|>>>>>>>)' "$dest"; then
+                echo "::error::Merge conflict when merging $f into $dest"
+                echo "Showing first 120 lines with conflict markers:"
+                sed -n '1,120p' "$dest" || true
+                exit 1
+              fi
+            done <<< "${GROUP[$dest]}"
+
+            git add -f "$dest"
+            rm -f "$basefile"
+          done
+
+          # Safety cleanup: delete any garbage files that poison compilation
+          rm -f "$SRC/org/apache/commons.java" || true
+          rm -f "$SRC/org/apache/commons/lang3/builder/class.java" || true
+          git rm -f --cached "$SRC/org/apache/commons.java" 2>/dev/null || true
+          git rm -f --cached "$SRC/org/apache/commons/lang3/builder/class.java" 2>/dev/null || true
+
+      # Rewrites Java test source files to enforce JUnit 5 assertions
+      - name: Enforce JUnit5 Assertions
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          root = Path("src/test/java")
+          if not root.exists():
+              raise SystemExit("src/test/java not found")
+
+          for p in root.rglob("*.java"):
+              s = p.read_text(encoding="utf-8")
+              s2 = s
+
+              s2 = re.sub(
+                  r'^\s*import\s+static\s+org\.junit\.Assert\.\*;\s*$',
+                  'import static org.junit.jupiter.api.Assertions.*;',
+                  s2, flags=re.M
+              )
+              s2 = re.sub(
+                  r'^\s*import\s+org\.junit\.Assert;\s*$',
+                  'import org.junit.jupiter.api.Assertions;',
+                  s2, flags=re.M
+              )
+
+              if "org.junit.jupiter.api.Assertions" in s2:
+                  s2 = re.sub(r'\bAssert\.', 'Assertions.', s2)
+
+              if s2 != s:
+                  p.write_text(s2, encoding="utf-8")
+          PY
+
+      # Verify that the patched code still compiles
+      - name: Verify test compilation
+        run: |
+          set -euo pipefail
+          mvn -q -DskipTests -Drat.skip=true -Dcheckstyle.skip=true -Dspotbugs.skip=true -Denforcer.skip=true test-compile
+
+      # Remove transient artifacts to avoid accidental commits
+      - name: Remove transient artifacts
+        run: |
+          set -euo pipefail
+          rm -rf "$GITHUB_WORKSPACE/CICD-FlakyDoctor" \
+                "$GITHUB_WORKSPACE/.nondex" || true
+
+          git restore --staged flakydoctor-output CICD-FlakyDoctor .nondex 2>/dev/null || true
+
+      # Commit and push generated patches to the FlakyDoctor work branch
+      - name: Commit and push
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          git add -A
+
+          # Stage ONLY what you want in the PR:
+          # - patched tests
+          # - pom.xml (only if you intend to include it)
+          git add -A src/test/java pom.xml
+
           if git diff --staged --quiet; then
-            echo "No changes -> no push"
+            echo "No changes; nothing to push"
             exit 0
           fi
+
           git commit -m "Apply FlakyDoctor patch for flaky tests"
           git push origin "${{ steps.branch.outputs.branch_name }}"
 
-      - name: Open Pull Request via API
+      # Create a pull request via the GitHub REST API
+      - name: Open Pull Request
         uses: actions/github-script@v7
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
-            const owner = context.repo.owner;
-            const repo  = context.repo.repo;
-            const head  = '${{ steps.branch.outputs.branch_name }}';
-            const base  = 'main';
-
-            try {
-              const res = await github.rest.pulls.create({
-                owner: owner,
-                repo: repo,
-                title: 'FlakyDoctor auto-patch: Fix flaky test(s)',
-                head: head,
-                base: base,
-                body: 'This PR was automatically created by FlakyDoctor after detecting and patching flaky tests.',
-                maintainer_can_modify: true,
-                draft: false
-              });
-              core.notice(`PR #${res.data.number} created`);
-            } catch (e) {
-              const msg = String((e && (e.message || e.status)) || '');
-              if (e.status === 422 && msg.includes('A pull request already exists')) {
-                core.notice('PR already exists for this branch; skipping');
-              } else {
-                throw e;
-              }
-            }
+            await github.rest.pulls.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: '${{ steps.branch.outputs.branch_name }}',
+              base: 'main',
+              title: 'FlakyDoctor auto-patch',
+              body: 'Automated fix for flaky tests'
+            })
