@@ -31,9 +31,9 @@ jobs:
       - name: Set ACTION_DIR
         run: |
           if [ -n "${ACT:-}" ]; then
-            ACTION_DIR="/var/run/act/actions/quintoorschot-CICD-FlakyDoctor@main"
+            ACTION_DIR="/var/run/act/actions/quintoorschot-AutoFlakyDoctor@main"
           else
-            ACTION_DIR="/__w/_actions/quintoorschot/CICD-FlakyDoctor/main"
+            ACTION_DIR="/__w/_actions/quintoorschot/AutoFlakyDoctor/main"
           fi
           echo "ACTION_DIR=$ACTION_DIR" >> "$GITHUB_ENV"
           echo "Using ACTION_DIR=$ACTION_DIR"
@@ -99,7 +99,7 @@ jobs:
 
       # Run FlakyDoctor GitHub Action
       - name: Run FlakyDoctor
-        uses: quintoorschot/CICD-FlakyDoctor@main
+        uses: quintoorschot/AutoFlakyDoctor@main
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY || secrets.OPEN_API_KEY }}
 
@@ -273,10 +273,10 @@ jobs:
       - name: Remove transient artifacts
         run: |
           set -euo pipefail
-          rm -rf "$GITHUB_WORKSPACE/CICD-FlakyDoctor" \
+          rm -rf "$GITHUB_WORKSPACE/AutoFlakyDoctor" \
                 "$GITHUB_WORKSPACE/.nondex" || true
 
-          git restore --staged flakydoctor-output CICD-FlakyDoctor .nondex 2>/dev/null || true
+          git restore --staged flakydoctor-output AutoFlakyDoctor .nondex 2>/dev/null || true
 
       # Commit and push generated patches to the FlakyDoctor work branch
       - name: Commit and push
